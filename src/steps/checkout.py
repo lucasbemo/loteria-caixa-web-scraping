@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 from ..config import AppConfig
 from ..errors import AutomationError
@@ -447,34 +447,73 @@ def _click_payment_submit_button(page: Page, config: AppConfig, logger: logging.
     return False
 
 
-def _payment_otp_selectors(config: AppConfig) -> list[str]:
+def _payment_otp_modal_input_selectors(config: AppConfig) -> list[str]:
     return [
         config.payment_otp_input_selector,
-        "#confirm-cancel-cvv input[data-checkout='securityCodeModal']",
-        "#confirm-cancel-cvv input[name='otp']",
-        "#confirm-cancel-cvv input[name*='codigo']",
-        "#confirm-cancel-cvv input[id*='codigo']",
-        "#confirm-cancel-cvv input[type='text']",
-        "#confirm-cancel-cvv input[type='tel']",
+        "input[data-checkout='securityCodeModal']",
         "input[name='otp']",
         "input[name='codigo']",
         "input[name*='codigo']",
         "input[id*='codigo']",
-        "input[placeholder*='Código de Segurança']",
+        "input[placeholder*='C\u00f3digo de Seguran\u00e7a']",
         "input[placeholder*='codigo de seguranca']",
-        "input[placeholder*='Código']",
+        "input[placeholder*='C\u00f3digo']",
         "input[placeholder*='codigo']",
-        ".modal input[placeholder*='Código de Segurança']",
-        ".modal input[placeholder*='Código']",
-        ".modal-dialog input[placeholder*='Código de Segurança']",
-        ".modal-dialog input[placeholder*='Código']",
-        "[role='dialog'] input[type='text']",
-        "[role='dialog'] input[type='tel']",
-        ".modal input[type='text']",
-        ".modal input[type='tel']",
         "input[inputmode='numeric']",
         "input[type='tel']",
+        "input[type='text']",
     ]
+
+
+def _find_visible_in_scope(scope: Locator, selectors: list[str], timeout_ms: int = 1200) -> Locator | None:
+    for selector in selectors:
+        if not selector or not selector.strip():
+            continue
+        locator = scope.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            return locator
+        except (PlaywrightTimeoutError, PlaywrightError):
+            continue
+    return None
+
+
+def _otp_submit_feedback_detected(page: Page) -> bool:
+    status_regex = re.compile(
+        r"processando|aguarde|analisando|confirmando|pagamento realizado|pagamento recusado|sucesso|falha|erro|comprovante",
+        re.IGNORECASE,
+    )
+    try:
+        return page.get_by_text(status_regex).first.is_visible(timeout=250)
+    except PlaywrightError:
+        return False
+
+
+def _wait_for_otp_submit_evidence(page: Page, timeout_ms: int = 3500, poll_ms: int = 250) -> str:
+    polls = max(1, timeout_ms // poll_ms)
+    for _ in range(polls):
+        if _otp_submit_feedback_detected(page):
+            return "feedback"
+        page.wait_for_timeout(poll_ms)
+
+    if _otp_submit_feedback_detected(page):
+        return "feedback"
+    if _otp_strict_modal_still_visible(page):
+        return "modal_open"
+    return "closed_no_feedback"
+
+
+def _fill_payment_otp_in_modal(page: Page, config: AppConfig, otp: str, logger: logging.Logger) -> None:
+    modal = _find_strict_payment_otp_modal(page)
+    if modal is None:
+        raise AutomationError("Strict payment OTP modal '#confirm-cancel-cvv' not found; refusing to fill code outside modal")
+
+    otp_input = _find_visible_in_scope(modal, _payment_otp_modal_input_selectors(config), timeout_ms=1400)
+    if otp_input is None:
+        raise AutomationError("Payment OTP input is not visible inside confirmation modal")
+
+    otp_input.fill(otp)
+    logger.info("Filled payment OTP inside modal")
 
 
 def _find_payment_otp_modal(page: Page):
@@ -529,20 +568,25 @@ def _find_payment_otp_modal(page: Page):
     return None
 
 
-def _otp_modal_submitted(page: Page) -> bool:
-    if not _is_confirmation_modal_visible(page):
-        return True
-    processing_regex = re.compile(r"processando|aguarde|analisando|confirmando", re.IGNORECASE)
+def _find_strict_payment_otp_modal(page: Page):
+    if _page_is_closed(page):
+        return None
+    strict_modal = page.locator("#confirm-cancel-cvv").first
     try:
-        return page.get_by_text(processing_regex).first.is_visible(timeout=300)
-    except PlaywrightError:
-        return False
+        strict_modal.wait_for(state="visible", timeout=700)
+        return strict_modal
+    except (PlaywrightTimeoutError, PlaywrightError):
+        return None
 
 
-def _otp_modal_confirm_still_visible(page: Page) -> bool:
+def _otp_modal_submitted(page: Page) -> bool:
+    return _otp_submit_feedback_detected(page)
+
+
+def _otp_strict_modal_still_visible(page: Page) -> bool:
     if _page_is_closed(page):
         return False
-    modal = _find_payment_otp_modal(page)
+    modal = _find_strict_payment_otp_modal(page)
     if modal is None:
         return False
     try:
@@ -551,102 +595,166 @@ def _otp_modal_confirm_still_visible(page: Page) -> bool:
         return False
 
 
+def _looks_like_modal_dismiss_action(candidate: Locator) -> bool:
+    confirm_regex = re.compile(
+        r"confirmar|confirmo|continuar|enviar|validar|pagar|concluir|prosseguir|finalizar|ok",
+        re.IGNORECASE,
+    )
+    dismiss_regex = re.compile(
+        r"\b(fechar|cancelar|voltar|corrigir|nao|n\u00e3o|close|dismiss|btn-close|modal-close)\b|(^|\s)x(\s|$)",
+        re.IGNORECASE,
+    )
+    snippets: list[str] = []
+
+    for getter in [
+        lambda: candidate.inner_text(timeout=250),
+        lambda: candidate.get_attribute("value"),
+        lambda: candidate.get_attribute("aria-label"),
+        lambda: candidate.get_attribute("title"),
+        lambda: candidate.get_attribute("id"),
+        lambda: candidate.get_attribute("class"),
+        lambda: candidate.get_attribute("name"),
+        lambda: candidate.get_attribute("data-dismiss"),
+        lambda: candidate.get_attribute("data-bs-dismiss"),
+        lambda: candidate.get_attribute("data-action"),
+        lambda: candidate.get_attribute("onclick"),
+    ]:
+        try:
+            value = getter()
+        except PlaywrightError:
+            value = None
+        if value and value.strip():
+            snippets.append(value.strip())
+
+    combined = " ".join(snippets)
+    if not combined:
+        return False
+
+    looks_confirm_action = confirm_regex.search(combined) is not None and dismiss_regex.search(combined) is None
+
+    for hard_dismiss_attr in ["data-dismiss", "data-bs-dismiss"]:
+        try:
+            attr_value = candidate.get_attribute(hard_dismiss_attr)
+        except PlaywrightError:
+            attr_value = None
+        if attr_value and "modal" in attr_value.lower() and not looks_confirm_action:
+            return True
+
+    return dismiss_regex.search(combined) is not None and not looks_confirm_action
+
+
+def _describe_click_candidate(candidate: Locator) -> str:
+    snippets: list[str] = []
+    fields = [
+        "id",
+        "class",
+        "name",
+        "aria-label",
+        "title",
+        "value",
+        "data-dismiss",
+        "data-bs-dismiss",
+        "type",
+    ]
+    for field in fields:
+        try:
+            value = candidate.get_attribute(field)
+        except PlaywrightError:
+            value = None
+        if value and value.strip():
+            snippets.append(f"{field}={value.strip()}")
+    try:
+        text = candidate.inner_text(timeout=250)
+    except PlaywrightError:
+        text = ""
+    text = " ".join(text.split())
+    if text:
+        snippets.append(f"text={text[:80]}")
+    return "; ".join(snippets) if snippets else "no-metadata"
+
+
 def _click_payment_otp_submit_button(page: Page, config: AppConfig, logger: logging.Logger) -> bool:
     if _page_is_closed(page):
         return False
 
-    strict_candidates = [
-        page.locator("#confirm-cancel-cvv #confirmarModalConfirmacao").first,
-        page.locator("#confirm-cancel-cvv button:has-text('Confirmar')").first,
-        page.locator("#confirm-cancel-cvv a:has-text('Confirmar')").first,
-    ]
-    for candidate in strict_candidates:
-        if _try_click(candidate, timeout_ms=2200):
-            page.wait_for_timeout(400)
-            logger.info("Clicked payment OTP submit using strict modal selector")
-            return True
+    modal = _find_strict_payment_otp_modal(page)
+    if modal is None:
+        logger.info("Strict OTP modal '#confirm-cancel-cvv' not visible; refusing submit click outside modal")
+        return False
 
     if config.payment_otp_submit_selector and config.payment_otp_submit_selector.strip():
-        sel = page.locator(config.payment_otp_submit_selector)
+        sel = modal.locator(config.payment_otp_submit_selector)
         try:
             count = sel.count()
         except PlaywrightError:
             count = 0
         for idx in range(count):
             candidate = sel.nth(idx)
+            if _looks_like_modal_dismiss_action(candidate):
+                logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", _describe_click_candidate(candidate))
+                continue
             if _try_click(candidate, timeout_ms=2200):
-                logger.info("Clicked payment OTP submit by selector")
+                logger.info(
+                    "Clicked payment OTP submit inside modal by configured selector (%s)",
+                    _describe_click_candidate(candidate),
+                )
                 return True
             try:
                 candidate.wait_for(state="visible", timeout=600)
                 candidate.click(timeout=1800, force=True)
-                logger.info("Clicked payment OTP submit by selector (force)")
+                logger.info(
+                    "Clicked payment OTP submit inside modal by configured selector (force) (%s)",
+                    _describe_click_candidate(candidate),
+                )
                 return True
             except (PlaywrightTimeoutError, PlaywrightError):
                 continue
 
-    modal = _find_payment_otp_modal(page)
-    if modal is not None:
-        modal_locators = [
-            modal.locator("#confirmarModalConfirmacao"),
-            modal.get_by_role("button", name=re.compile(r"confirmar", re.IGNORECASE)),
-            modal.locator("button:has-text('Confirmar')"),
-            modal.locator("a:has-text('Confirmar')"),
-            modal.locator("input[type='button'][value*='Confirmar']"),
-            modal.locator("input[type='submit'][value*='Confirmar']"),
-            modal.locator("button").filter(has_text=re.compile(r"confirmar|continuar|enviar|validar", re.IGNORECASE)),
-        ]
-        for loc in modal_locators:
-            try:
-                count = loc.count()
-            except PlaywrightError:
-                count = 0
-            for idx in range(count):
-                candidate = loc.nth(idx)
-                try:
-                    candidate.wait_for(state="visible", timeout=900)
-                except (PlaywrightTimeoutError, PlaywrightError):
-                    continue
-
-                if _try_click(candidate, timeout_ms=2400):
-                    page.wait_for_timeout(450)
-                    logger.info("Clicked payment OTP submit inside modal")
-                    return True
-                try:
-                    candidate.click(timeout=1800, force=True)
-                    page.wait_for_timeout(450)
-                    logger.info("Clicked payment OTP submit inside modal (force)")
-                    return True
-                except (PlaywrightTimeoutError, PlaywrightError):
-                    try:
-                        candidate.evaluate("el => el.click()")
-                        page.wait_for_timeout(450)
-                        logger.info("Clicked payment OTP submit inside modal (evaluate)")
-                        return True
-                    except PlaywrightError:
-                        continue
-
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"confirmar|continuar|enviar|validar", re.IGNORECASE)).first,
-        page.locator("[role='dialog'] button:has-text('Confirmar')").first,
-        page.locator(".modal-dialog button:has-text('Confirmar')").first,
-        page.locator(".modal button:has-text('Confirmar')").first,
-        page.locator("button:has-text('Confirmar')").first,
-        page.locator("button:has-text('Continuar')").first,
+    modal_locators = [
+        modal.locator("#confirmarModalConfirmacao"),
+        modal.get_by_role("button", name=re.compile(r"confirmar", re.IGNORECASE)),
+        modal.locator("button:has-text('Confirmar')"),
+        modal.locator("a:has-text('Confirmar')"),
+        modal.locator("input[type='button'][value*='Confirmar']"),
+        modal.locator("input[type='submit'][value*='Confirmar']"),
+        modal.locator("button").filter(has_text=re.compile(r"confirmar|continuar|enviar|validar", re.IGNORECASE)),
     ]
-    for candidate in candidates:
-        if _try_click(candidate, timeout_ms=2200):
-            page.wait_for_timeout(400)
-            logger.info("Clicked payment OTP submit by text/role")
-            return True
+    for loc in modal_locators:
         try:
-            candidate.wait_for(state="visible", timeout=700)
-            candidate.click(timeout=1800, force=True)
-            page.wait_for_timeout(350)
-            logger.info("Clicked payment OTP submit by text/role (force)")
-            return True
-        except (PlaywrightTimeoutError, PlaywrightError):
-            continue
+            count = loc.count()
+        except PlaywrightError:
+            count = 0
+        for idx in range(count):
+            candidate = loc.nth(idx)
+            try:
+                candidate.wait_for(state="visible", timeout=900)
+            except (PlaywrightTimeoutError, PlaywrightError):
+                continue
+
+            if _looks_like_modal_dismiss_action(candidate):
+                logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", _describe_click_candidate(candidate))
+                continue
+
+            if _try_click(candidate, timeout_ms=2400):
+                page.wait_for_timeout(450)
+                logger.info("Clicked payment OTP submit inside modal (%s)", _describe_click_candidate(candidate))
+                return True
+            try:
+                candidate.click(timeout=1800, force=True)
+                page.wait_for_timeout(450)
+                logger.info("Clicked payment OTP submit inside modal (force) (%s)", _describe_click_candidate(candidate))
+                return True
+            except (PlaywrightTimeoutError, PlaywrightError):
+                try:
+                    candidate.evaluate("el => el.click()")
+                    page.wait_for_timeout(450)
+                    logger.info(
+                        "Clicked payment OTP submit inside modal (evaluate) (%s)",
+                        _describe_click_candidate(candidate),
+                    )
+                    return True
+                except PlaywrightError:
+                    continue
 
     return False
 
@@ -887,27 +995,35 @@ def run_checkout_and_payment(page: Page, config: AppConfig, logger: logging.Logg
     if not otp:
         raise AutomationError("Payment OTP cannot be empty")
 
-    fill_first_available(
-        page,
-        otp,
-        _payment_otp_selectors(config),
-    )
+    _fill_payment_otp_in_modal(page, config, otp, logger)
     page.wait_for_timeout(350)
-    if not _click_payment_otp_submit_button(page, config, logger):
-        raise AutomationError("No visible payment OTP submit button found")
 
-    for _ in range(2):
-        if _page_is_closed(page):
-            break
-        page.wait_for_timeout(450)
-        if not _otp_modal_confirm_still_visible(page):
-            break
-        logger.info("OTP modal confirm still visible; retrying confirm click")
+    attempts = 2
+    submitted = False
+    closed_without_feedback = False
+    for attempt in range(1, attempts + 1):
         if not _click_payment_otp_submit_button(page, config, logger):
             break
 
-    if not _page_is_closed(page) and _otp_modal_confirm_still_visible(page):
-        raise AutomationError("Payment OTP modal is still open after confirm click")
+        submit_state = _wait_for_otp_submit_evidence(page, timeout_ms=3500, poll_ms=250)
+        if submit_state == "feedback" and _otp_modal_submitted(page):
+            submitted = True
+            break
+
+        if submit_state == "closed_no_feedback":
+            logger.error("OTP modal closed without payment processing confirmation markers after submit click")
+            closed_without_feedback = True
+            break
+
+        if attempt < attempts:
+            logger.info("OTP modal still open with no processing feedback; retrying modal confirm click")
+
+    if not submitted:
+        if _otp_strict_modal_still_visible(page):
+            raise AutomationError("Payment OTP modal is still open after modal-scoped confirm clicks")
+        if closed_without_feedback:
+            save_snapshot(page, run_dir, "payment_otp_closed_no_feedback")
+        raise AutomationError("OTP modal closed without payment processing confirmation markers")
 
     save_snapshot(page, run_dir, "payment_otp_submitted")
 

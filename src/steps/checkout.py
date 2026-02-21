@@ -512,8 +512,26 @@ def _fill_payment_otp_in_modal(page: Page, config: AppConfig, otp: str, logger: 
     if otp_input is None:
         raise AutomationError("Payment OTP input is not visible inside confirmation modal")
 
-    otp_input.fill(otp)
-    logger.info("Filled payment OTP inside modal")
+    # The site uses Angular ng-keyup, so we must simulate real keystrokes
+    otp_input.click()
+    page.wait_for_timeout(100)
+    otp_input.press_sequentially(otp, delay=50)
+    
+    # Force Angular model update
+    try:
+        otp_input.press("Tab", timeout=500)
+    except Exception:
+        pass
+        
+    # As an extra safety measure, try to submit via Enter key directly on the input field
+    try:
+        otp_input.press("Enter", timeout=500)
+        logger.info("Pressed Enter on payment OTP input")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+        
+    logger.info("Filled payment OTP inside modal with sequential key presses")
 
 
 def _find_payment_otp_modal(page: Page):
@@ -691,8 +709,16 @@ def _click_payment_otp_submit_button(page: Page, config: AppConfig, logger: logg
         for idx in range(count):
             candidate = sel.nth(idx)
             if _looks_like_modal_dismiss_action(candidate):
-                logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", _describe_click_candidate(candidate))
-                continue
+                candidate_text = _describe_click_candidate(candidate)
+                if "Confirmar" in candidate_text or "confirmarModalConfirmacao" in candidate_text:
+                    logger.info("Candidate looks like a dismiss action but matches strict confirm criteria; proceeding and stripping data-dismiss")
+                    try:
+                        candidate.evaluate("el => el.removeAttribute('data-dismiss')")
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", candidate_text)
+                    continue
             if _try_click(candidate, timeout_ms=2200):
                 logger.info(
                     "Clicked payment OTP submit inside modal by configured selector (%s)",
@@ -732,8 +758,19 @@ def _click_payment_otp_submit_button(page: Page, config: AppConfig, logger: logg
                 continue
 
             if _looks_like_modal_dismiss_action(candidate):
-                logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", _describe_click_candidate(candidate))
-                continue
+                # The 'Confirmar' button in this specific modal has a buggy data-dismiss="modal" attribute.
+                # If we skip it entirely because of this heuristic, we might not be able to click anything.
+                # However, if it strictly matches our confirm regex, we should allow it but strip the buggy attribute.
+                candidate_text = _describe_click_candidate(candidate)
+                if "Confirmar" in candidate_text or "confirmarModalConfirmacao" in candidate_text:
+                    logger.info("Candidate looks like a dismiss action but matches strict confirm criteria; proceeding and stripping data-dismiss")
+                    try:
+                        candidate.evaluate("el => el.removeAttribute('data-dismiss')")
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Skipping OTP modal candidate that looks like dismiss action: %s", candidate_text)
+                    continue
 
             if _try_click(candidate, timeout_ms=2400):
                 page.wait_for_timeout(450)
